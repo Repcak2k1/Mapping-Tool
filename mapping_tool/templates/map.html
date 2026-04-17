@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Relay Planner – Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <!-- Leaflet CSS (no integrity / crossorigin) -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+
+  <!-- Leaflet.draw CSS (no integrity / crossorigin) -->
+  <link
+    rel="stylesheet"
+    href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"
+  />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      font-family: sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+    }
+
+    /* Top bar */
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    #toolbar h1 {
+      font-size: 1rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      margin-right: 16px;
+    }
+
+    .btn {
+      padding: 5px 13px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 600;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.82; }
+
+    .btn-save   { background: #4caf50; color: #fff; }
+    .btn-clear  { background: #e53935; color: #fff; }
+    .btn-reload { background: #1565c0; color: #fff; }
+
+    #status {
+      margin-left: auto;
+      font-size: 0.78rem;
+      color: #90caf9;
+      min-width: 180px;
+      text-align: right;
+    }
+
+    #map {
+      flex: 1;
+      width: 100%;
+    }
+    .gateway-icon {
+      background: #ffb300;
+      color: #000;
+      border-radius: 50%;
+      border: 2px solid #f57c00;
+      text-align: center;
+      line-height: 24px;
+      font-weight: 900;
+      font-size: 16px;
+      box-shadow: 0 0 4px rgba(0, 0, 0, 0.6);
+    }
+  </style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>Relay Planner</h1>
+
+  <button class="btn btn-save"   id="btn-save">Save shapes</button>
+  <button class="btn btn-reload" id="btn-reload">Reload saved</button>
+  <button class="btn btn-clear"  id="btn-clear">Clear shapes</button>
+
+  <button class="btn" id="btn-generate-mesh" style="background:#29b6f6; color:#000;">
+    Generate mesh
+  </button>
+
+  <button class="btn" id="btn-clear-mesh" style="background:#00838f; color:#fff;">
+    Clear mesh
+  </button>
+
+  <button class="btn" id="btn-set-gateway"   style="background:#ffb300; color:#000;">Set gateway</button>
+  <button class="btn" id="btn-clear-gateway" style="background:#757575; color:#fff;">Clear gateway</button>
+
+  <span id="status">Ready</span>
+</div>
+
+<div id="map"></div>
+
+<!-- Leaflet JS (no integrity / crossorigin) -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- Leaflet.draw JS (no integrity / crossorigin) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+<script>
+  // Config from Flask (use tojson to ensure valid JS)
+  const CFG = {
+    lat     : {{ center_lat    | tojson }},
+    lng     : {{ center_lng    | tojson }},
+    zoom    : {{ zoom          | tojson }},
+    tileUrl : {{ tile_url      | tojson }},
+    tileAttr: {{ tile_attr     | tojson }},
+    maxZoom : {{ tile_max_zoom | tojson }},
+  };
+
+  const statusEl = document.getElementById("status");
+  function setStatus(text, color="#90caf9") {
+    statusEl.textContent = text;
+    statusEl.style.color = color;
+  }
+
+  // Map init
+  const map = L.map("map").setView([CFG.lat, CFG.lng], CFG.zoom);
+
+  L.tileLayer(CFG.tileUrl, {
+    maxZoom: CFG.maxZoom,
+    attribution: CFG.tileAttr,
+  }).addTo(map);
+
+  const drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+
+  const meshLayer = new L.FeatureGroup();
+  map.addLayer(meshLayer);
+
+  const drawControl = new L.Control.Draw({
+    position: "topleft",
+    edit: {
+      featureGroup: drawnItems,
+      remove: true,
+    },
+    draw: {
+      marker: true,
+      polygon: {
+        allowIntersection: false,
+        showArea: true,
+      },
+      rectangle: {
+        showArea: true,
+      },
+      circle: false,
+      polyline: false,
+      circlemarker: false,
+    },
+  });
+  map.addControl(drawControl);
+
+  // ---------------------------------------------------------------------
+// Gateway handling
+// ---------------------------------------------------------------------
+
+let gatewayMarker = null;
+let gatewaySetMode = false;
+
+// Simple gateway icon (gold-ish marker)
+const gatewayIcon = L.divIcon({
+  className: "gateway-icon",
+  html: "&#8962;",   // Unicode 'house' (⌂); you can also use "G" or "GW"
+  iconSize: [28, 28],
+  iconAnchor: [14, 28],
+});
+
+// When "Set gateway" mode is active, the next map click sets it
+map.on("click", async (e) => {
+  if (!gatewaySetMode) return;
+
+  const { lat, lng } = e.latlng;
+
+  // Remove old gateway marker if exists
+  if (gatewayMarker) {
+    map.removeLayer(gatewayMarker);
+  }
+
+  gatewayMarker = L.marker([lat, lng], { icon: gatewayIcon })
+    .addTo(map)
+    .bindPopup("Gateway");
+
+  setStatus(`Gateway set at (${lat.toFixed(5)}, ${lng.toFixed(5)})`, "#ffd54f");
+  gatewaySetMode = false;
+
+  // Persist to backend
+  try {
+    await fetch("/api/gateway", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lat, lng }),
+    });
+  } catch (err) {
+    console.error("Failed to save gateway", err);
+    setStatus("Gateway save failed – see console", "#ef9a9a");
+  }
+});
+
+// Load existing gateway from backend on startup
+async function loadGateway() {
+  try {
+    const resp = await fetch("/api/gateway");
+    if (!resp.ok) return;
+
+    const feature = await resp.json();
+    if (!feature) return;
+
+    const [lng, lat] = feature.geometry.coordinates;
+    if (gatewayMarker) map.removeLayer(gatewayMarker);
+
+    gatewayMarker = L.marker([lat, lng], { icon: gatewayIcon })
+      .addTo(map)
+      .bindPopup("Gateway");
+
+    setStatus("Gateway loaded", "#a5d6a7");
+  } catch (err) {
+    console.error("Failed to load gateway", err);
+  }
+}
+
+async function clearGateway() {
+  if (!gatewayMarker) {
+    setStatus("No gateway to clear", "#90caf9");
+    return;
+  }
+  if (!confirm("Remove the defined gateway?")) return;
+
+  map.removeLayer(gatewayMarker);
+  gatewayMarker = null;
+
+  try {
+    await fetch("/api/gateway", { method: "DELETE" });
+    setStatus("Gateway cleared", "#90caf9");
+  } catch (err) {
+    console.error("Failed to clear gateway", err);
+    setStatus("Gateway clear failed – see console", "#ef9a9a");
+  }
+}
+
+async function clearMesh() {
+  // Clear map layer immediately
+  meshLayer.clearLayers();
+  setStatus("Mesh cleared from map", "#90caf9");
+
+  // Optional: also clear saved mesh on backend
+  try {
+    await fetch("/api/mesh", { method: "DELETE" });
+  } catch (err) {
+    console.error("Mesh clear failed", err);
+    // We already cleared the visual layer, so keep status as info
+  }
+}
+
+  map.on(L.Draw.Event.CREATED, (e) => {
+    drawnItems.addLayer(e.layer);
+    const n = Object.keys(drawnItems._layers).length;
+    setStatus(`${n} shape(s) on map – unsaved`, "#ffb74d");
+  });
+  map.on(L.Draw.Event.EDITED, () => setStatus("Shapes edited – unsaved", "#ffb74d"));
+  map.on(L.Draw.Event.DELETED, () => {
+    const n = Object.keys(drawnItems._layers).length;
+    setStatus(`${n} shape(s) on map – unsaved`, "#ffb74d");
+  });
+
+  // Serialize layers → GeoJSON FeatureCollection
+  function collectGeoJSON() {
+    const features = [];
+    drawnItems.eachLayer((layer) => {
+      if (layer instanceof L.Circle && !(layer instanceof L.CircleMarker)) {
+        const center = layer.getLatLng();
+        features.push({
+          type: "Feature",
+          geometry: {
+            type: "Point",
+            coordinates: [center.lng, center.lat],
+          },
+          properties: {
+            shape_type: "circle",
+            radius: layer.getRadius(), // metres
+          },
+        });
+      } else {
+        const f = layer.toGeoJSON();
+        const shapeType =
+          layer instanceof L.Marker    ? "marker"    :
+          layer instanceof L.Rectangle ? "rectangle" : "polygon";
+        f.properties = f.properties || {};
+        f.properties.shape_type = shapeType;
+        features.push(f);
+      }
+    });
+    return { type: "FeatureCollection", features };
+  }
+
+  function loadGeoJSON(geojson) {
+    if (!geojson || !Array.isArray(geojson.features)) return;
+    geojson.features.forEach((feature) => {
+      const props = feature.properties || {};
+      let layer;
+
+      if (props.shape_type === "circle") {
+        const [lng, lat] = feature.geometry.coordinates;
+        layer = L.circle([lat, lng], { radius: props.radius });
+      } else if (props.shape_type === "rectangle") {
+        const coords = feature.geometry.coordinates[0];
+        const latLngs = coords.map(([lng, lat]) => [lat, lng]);
+        layer = L.polygon(latLngs);
+      } else {
+        layer = L.geoJSON(feature).getLayers()[0];
+      }
+
+      if (layer) drawnItems.addLayer(layer);
+    });
+  }
+
+  function renderMesh(meshGeoJSON) {
+    meshLayer.clearLayers();
+    if (!meshGeoJSON || !Array.isArray(meshGeoJSON.features)) return;
+
+    const relayRangeM = meshGeoJSON.properties?.relay_range_m ?? 10000; // default 10km
+
+    meshGeoJSON.features.forEach((feature) => {
+      const props = feature.properties || {};
+      const geom  = feature.geometry || {};
+      const type  = props.type;
+
+      if (geom.type === "Point" && type === "relay") {
+        const [lng, lat] = geom.coordinates;
+
+        // Relay marker
+        const relayMarker = L.circleMarker([lat, lng], {
+          radius: 4,
+          color: "#29b6f6",
+          fillColor: "#29b6f6",
+          fillOpacity: 0.9,
+          weight: 1.5,
+        }).bindPopup(`Relay ${props.id || ""}`);
+        meshLayer.addLayer(relayMarker);
+
+        // Coverage circle (semi-transparent green)
+        const covCircle = L.circle([lat, lng], {
+          radius: relayRangeM,   // metres
+          color: "#2e7d32",
+          weight: 1,
+          opacity: 0.4,
+          fillColor: "#66bb6a",
+          fillOpacity: 0.18,
+        });
+        meshLayer.addLayer(covCircle);
+
+      } else if (geom.type === "LineString" && type === "link") {
+        const coords = geom.coordinates.map(([lng, lat]) => [lat, lng]);
+        const link = L.polyline(coords, {
+          color: "#80cbc4",
+          weight: 2,
+          opacity: 0.9,
+        });
+        meshLayer.addLayer(link);
+      }
+    });
+  }
+
+  async function saveShapes() {
+    const geojson = collectGeoJSON();
+    const n = geojson.features.length;
+    if (n === 0) {
+      setStatus("Nothing to save", "#ef9a9a");
+      return;
+    }
+    setStatus("Saving…", "#fff");
+    try {
+      const resp = await fetch("/api/shapes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(geojson),
+      });
+      const data = await resp.json();
+      if (resp.ok) {
+        setStatus(`Saved ${data.saved_features} feature(s)`, "#a5d6a7");
+      } else {
+        setStatus(`Error: ${data.message}`, "#ef9a9a");
+      }
+    } catch (err) {
+      console.error(err);
+      setStatus("Save failed – see console", "#ef9a9a");
+    }
+  }
+
+  async function reloadShapes() {
+    setStatus("Loading…", "#fff");
+    try {
+      const resp = await fetch("/api/shapes");
+      const geojson = await resp.json();
+      drawnItems.clearLayers();
+      loadGeoJSON(geojson);
+      const n = geojson.features?.length || 0;
+      n > 0
+        ? setStatus(`Loaded ${n} feature(s)`, "#a5d6a7")
+        : setStatus("No saved shapes", "#90caf9");
+    } catch (err) {
+      console.error(err);
+      setStatus("Load failed – see console", "#ef9a9a");
+    }
+  }
+
+  async function clearAll() {
+    if (!confirm("Delete ALL shapes from map and file?")) return;
+    drawnItems.clearLayers();
+    try {
+      await fetch("/api/shapes", { method: "DELETE" });
+      setStatus("All shapes cleared", "#90caf9");
+    } catch (err) {
+      console.error(err);
+      setStatus("Clear failed – see console", "#ef9a9a");
+    }
+  }
+
+  async function generateMesh() {
+    setStatus("Generating mesh…", "#fff");
+    try {
+      const resp = await fetch("/api/mesh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        const msg  = data.message || `HTTP ${resp.status}`;
+        setStatus(`Mesh error: ${msg}`, "#ef9a9a");
+        return;
+      }
+
+      const mesh = await resp.json();
+      renderMesh(mesh);
+      const nRelays = (mesh.features || []).filter(
+        (f) => f.properties && f.properties.type === "relay"
+      ).length;
+      setStatus(`Mesh generated – ${nRelays} relay(s)`, "#a5d6a7");
+    } catch (err) {
+      console.error("Mesh generation failed", err);
+      setStatus("Mesh generation failed – see console", "#ef9a9a");
+    }
+  }
+
+document.getElementById("btn-save").addEventListener("click", saveShapes);
+document.getElementById("btn-reload").addEventListener("click", reloadShapes);
+document.getElementById("btn-clear").addEventListener("click", clearAll);
+
+document.getElementById("btn-generate-mesh").addEventListener("click", generateMesh);
+document.getElementById("btn-clear-mesh").addEventListener("click", clearMesh);
+
+document.getElementById("btn-set-gateway").addEventListener("click", () => {
+  gatewaySetMode = true;
+  setStatus("Click on the map to set gateway", "#ffd54f");
+});
+document.getElementById("btn-clear-gateway").addEventListener("click", clearGateway);
+
+// On startup: load shapes and gateway
+reloadShapes();
+loadGateway();
+</script>
+</body>
+</html>
